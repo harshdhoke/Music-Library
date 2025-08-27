@@ -3,31 +3,92 @@
 #include <string>
 #include <unordered_map>
 #include <stack>
-#include <thread> // Required for multithreading
-#include <mutex>  // Required for thread safety
+#include <thread>
 
-using namespace std;
+// --- Thread Safety Primitives ---
 
-// A mutex to protect cout for synchronized output
-mutex cout_mutex;
+// A SpinLock implementation using GCC/Clang compiler intrinsics.
+// This avoids using <atomic> or <mutex> libraries.
+struct SpinLock {
+    volatile int lock_flag;
 
+    SpinLock() : lock_flag(0) {}
+
+    void lock() {
+        while (__sync_lock_test_and_set(&lock_flag, 1)) {
+            // Busy-wait (spin) until the lock is acquired.
+        }
+    }
+
+    void unlock() {
+        __sync_lock_release(&lock_flag);
+    }
+};
+
+// --- Query Data Structure ---
+
+// A struct to hold query data, making it easy to pass through the queue.
+struct Query {
+    int op;
+    int node_id;
+    int uid;
+    bool is_sentinel = false; // Flag to signal the end of work.
+};
+
+// --- Custom Thread-Safe Queue ---
+
+// A simple, custom thread-safe queue for the producer-consumer model.
+// It uses our SpinLock for synchronization.
+// Note: All members are public by default in a struct.
+class ThreadSafeQueue {
+    std::vector<Query> data;
+    size_t head = 0;
+    SpinLock spinlock;
+
+public: // Explicitly marking public for clarity, though not strictly necessary
+    // Pushes a query to the back of the queue.
+    void push(const Query& q) {
+        spinlock.lock();
+        data.push_back(q);
+        spinlock.unlock();
+    }
+
+    // Tries to pop a query from the front of the queue.
+    // Returns true if a query was popped, false otherwise.
+    bool pop(Query& q) {
+        spinlock.lock();
+        if (head < data.size()) {
+            q = data[head];
+            head++;
+            spinlock.unlock();
+            return true;
+        }
+        spinlock.unlock();
+        return false;
+    }
+};
+
+
+// --- Tree Locking Mechanism (Thread-Safe) ---
+
+// Note: All members are public by default in a struct.
 struct TreeLocker {
     int n, m;
-    vector<int> parent;
-    vector<int> lockedBy;
-    vector<int> descLocked;
-    // Mutex to make the TreeLocker thread-safe
-    mutex mtx;
+    std::vector<int> parent;
+    std::vector<int> lockedBy;
+    std::vector<int> descLocked;
+    SpinLock spinlock; // A spinlock to protect the tree's internal state.
 
     TreeLocker(int n_, int m_) : n(n_), m(m_) {
         parent.assign(n, -1);
         lockedBy.assign(n, 0);
         descLocked.assign(n, 0);
-        for (int i = 1; i < n; ++i) parent[i] = (i - 1) / m;
+        for (int i = 1; i < n; ++i) {
+            parent[i] = (i - 1) / m;
+        }
     }
 
     // Helper function to check for locked ancestors.
-    // This function is called from within locked methods, so it doesn't need its own lock.
     bool hasLockedAncestor(int v) {
         int p = parent[v];
         while (p != -1) {
@@ -37,9 +98,8 @@ struct TreeLocker {
         return false;
     }
 
-    // Helper function to update ancestor descendant lock counts.
-    // This is also called from within locked methods.
-    void addToAncestors(int v, int delta) {
+    // Helper function to update the descendant lock count for all ancestors.
+    void updateAncestorDescLockCount(int v, int delta) {
         int p = parent[v];
         while (p != -1) {
             descLocked[p] += delta;
@@ -47,128 +107,157 @@ struct TreeLocker {
         }
     }
 
-    // Locks a node if possible.
-    // This is a critical section and needs to be protected by a lock.
     bool lockNode(int v, int uid) {
-        // lock_guard ensures the mutex is unlocked when the function returns
-        lock_guard<mutex> lock(mtx);
-        if (lockedBy[v] != 0) return false;
-        if (hasLockedAncestor(v)) return false;
-        if (descLocked[v] != 0) return false;
+        spinlock.lock();
+        if (lockedBy[v] != 0 || hasLockedAncestor(v) || descLocked[v] != 0) {
+            spinlock.unlock();
+            return false;
+        }
         lockedBy[v] = uid;
-        addToAncestors(v, 1);
+        updateAncestorDescLockCount(v, 1);
+        spinlock.unlock();
         return true;
     }
 
-    // Unlocks a node if it was locked by the same user.
-    // This is a critical section.
     bool unlockNode(int v, int uid) {
-        lock_guard<mutex> lock(mtx);
-        if (lockedBy[v] != uid) return false;
+        spinlock.lock();
+        if (lockedBy[v] != uid) {
+            spinlock.unlock();
+            return false;
+        }
         lockedBy[v] = 0;
-        addToAncestors(v, -1);
+        updateAncestorDescLockCount(v, -1);
+        spinlock.unlock();
         return true;
     }
 
-    // Upgrades a lock on a node.
-    // This is the most complex critical section.
     bool upgradeNode(int v, int uid) {
-        lock_guard<mutex> lock(mtx);
-        if (lockedBy[v] != 0) return false;
-        if (hasLockedAncestor(v)) return false;
-        if (descLocked[v] == 0) return false;
+        spinlock.lock();
+        if (lockedBy[v] != 0 || hasLockedAncestor(v) || descLocked[v] == 0) {
+            spinlock.unlock();
+            return false;
+        }
 
-        vector<int> toUnlock;
-        stack<int> st;
-        st.push(v);
-        bool ok = true;
+        std::vector<int> descendantsToUnlock;
+        std::stack<int> nodesToVisit;
+        nodesToVisit.push(v);
+        bool canUpgrade = true;
 
-        // Check if all locked descendants are locked by the current user
-        while (!st.empty() && ok) {
-            int u = st.top(); st.pop();
-            long long base = 1LL * u * m + 1;
+        while (!nodesToVisit.empty()) {
+            int u = nodesToVisit.top();
+            nodesToVisit.pop();
+            long long firstChild = 1LL * u * m + 1;
             for (long long j = 0; j < m; ++j) {
-                long long c = base + j;
-                if (c >= n) break;
-                int w = (int)c;
+                long long childIndex = firstChild + j;
+                if (childIndex >= n) break;
+                int w = static_cast<int>(childIndex);
                 if (lockedBy[w] != 0) {
                     if (lockedBy[w] != uid) {
-                        ok = false;
+                        canUpgrade = false;
                         break;
                     }
-                    toUnlock.push_back(w);
+                    descendantsToUnlock.push_back(w);
                 } else if (descLocked[w] > 0) {
-                    st.push(w);
+                    nodesToVisit.push(w);
                 }
             }
+            if (!canUpgrade) break;
         }
-        if (!ok) return false;
 
-        // If the check passes, perform the upgrade
-        for (int u : toUnlock) {
-            // The lockedBy[u] is already checked to be equal to uid
+        if (!canUpgrade) {
+            spinlock.unlock();
+            return false;
+        }
+
+        for (int u : descendantsToUnlock) {
             lockedBy[u] = 0;
-            addToAncestors(u, -1);
+            updateAncestorDescLockCount(u, -1);
         }
         lockedBy[v] = uid;
-        addToAncestors(v, 1);
+        updateAncestorDescLockCount(v, 1);
+        spinlock.unlock();
         return true;
     }
 };
 
-// Function to be executed by each thread
-void process_query(TreeLocker& tl, int op, int v, int uid, vector<bool>& results, int query_index) {
-    bool res = false;
-    if (op == 1) res = tl.lockNode(v, uid);
-    else if (op == 2) res = tl.unlockNode(v, uid);
-    else if (op == 3) res = tl.upgradeNode(v, uid);
-    results[query_index] = res;
+// --- Consumer/Worker Function ---
+
+// The worker function that will run on a separate thread.
+void process_queries(ThreadSafeQueue& queue, TreeLocker& tl) {
+    while (true) {
+        Query q;
+        // Continuously try to pop from the queue.
+        if (queue.pop(q)) {
+            // If it's the sentinel value, stop processing.
+            if (q.is_sentinel) {
+                break;
+            }
+
+            // Process the actual query.
+            bool res = false;
+            if (q.op == 1) {
+                res = tl.lockNode(q.node_id, q.uid);
+            } else if (q.op == 2) {
+                res = tl.unlockNode(q.node_id, q.uid);
+            } else if (q.op == 3) {
+                res = tl.upgradeNode(q.node_id, q.uid);
+            }
+            std::cout << (res ? "true" : "false") << "\n";
+        }
+        // If the queue is empty, this thread will effectively "spin,"
+        // repeatedly checking the queue until there's work to do.
+    }
 }
 
+
+// --- Main Execution (Producer) ---
+
 int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
 
     int N, m, Q;
-    if (!(cin >> N)) return 0;
-    cin >> m >> Q;
+    if (!(std::cin >> N)) return 0;
+    std::cin >> m >> Q;
 
-    vector<string> names(N);
-    unordered_map<string, int> id;
-    id.reserve(N * 2);
-
+    std::unordered_map<std::string, int> name_to_id;
+    name_to_id.reserve(N);
     for (int i = 0; i < N; ++i) {
-        cin >> names[i];
-        id[names[i]] = i;
+        std::string name;
+        std::cin >> name;
+        name_to_id[name] = i;
     }
 
+    // Create shared resources.
     TreeLocker tl(N, m);
+    ThreadSafeQueue queue;
 
-    vector<thread> threads;
-    vector<bool> results(Q);
+    // Launch the consumer/worker thread.
+    std::thread worker_thread(process_queries, std::ref(queue), std::ref(tl));
 
-    // Create a thread for each query
+    // Main thread acts as the producer.
     for (int i = 0; i < Q; ++i) {
         int op;
-        string node;
+        std::string node_name;
         long long uid;
-        cin >> op >> node >> uid;
-        int v = id[node];
-        // Launch a new thread to process the query
-        threads.emplace_back(process_query, ref(tl), op, v, (int)uid, ref(results), i);
+        std::cin >> op >> node_name >> uid;
+        
+        Query q;
+        q.op = op;
+        q.node_id = name_to_id[node_name];
+        q.uid = (int)uid;
+        
+        queue.push(q);
     }
 
-    // Wait for all threads to complete
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
+    // After pushing all real queries, push a sentinel value
+    // to signal the worker thread to terminate.
+    Query sentinel_query;
+    sentinel_query.is_sentinel = true;
+    queue.push(sentinel_query);
 
-    // Print results in order
-    for (int i = 0; i < Q; ++i) {
-        cout << (results[i] ? "true" : "false") << "\n";
-    }
+    // Wait for the worker thread to finish its job.
+    worker_thread.join();
 
     return 0;
 }
